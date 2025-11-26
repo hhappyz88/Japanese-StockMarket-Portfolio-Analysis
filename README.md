@@ -1,1 +1,1 @@
-This contains portfolio analysis work on stocks from the Japanese and Vietnamese stock markets. The code can be found in the rmd file, and the correspondinbg report can be found in Japanese Stocks.docx.
+This contains portfolio analysis work on stocks from the Japanese and Vietnamese stock markets. The code can be found in the rmd file, and the corresponding report can be found in Japanese Stocks.docx.
