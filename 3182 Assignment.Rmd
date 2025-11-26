@@ -1,0 +1,713 @@
+---
+title: "3182 Assignment"
+author: "Henry Zhang z5363805"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+An explanation of some naming conventions and how to generally read this document. Most intermediate objects created for the purpose of data analysis are named with the convention of what statistic they are, followed by their information. For example, you'll see see that the all of the imported files are named data_market, data_TSE, etc. For reference, commonly used descriptions include:
+
+-   TSE - Tokyo Stock Exchange
+
+-   HOSE - Vietnamese Stock Exchange
+
+-   JGB - 3 Month Japanese Government Bond
+
+-   stocks - combination of TSE and HOSE
+
+-   combined - TSE and JGB
+
+-   everything - TSE, HOSE, and JGB
+
+Any statistics explicitly requested for by each question has been stored in variables named q{number}.
+
+```{r}
+#{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# install packages if they do not exist
+# install.packages("PerformanceAnalytics", dependencies = TRUE)
+# install.packages("quadprog", repos="http://cran.rstudio.com")
+# install.packages("IntroCompFinR", repos="http://R-Forge.R-project.org")
+# install.packages("tidyverse")
+
+library(PerformanceAnalytics)
+library(readr)
+library(dplyr)
+library(quadprog)
+library(IntroCompFinR)
+library(xts)
+library(ggplot2)
+library(ggrepel)
+library(reshape2)
+library(scales)
+options(scipen=999)
+
+```
+
+## Import Files
+
+```{r}
+VND_to_JPY_Exchange_rate <- read_csv("VND to JPY Exchange rate.csv")
+
+data_JGB <- read_csv("Japan 3-month Government Bond.csv") %>%
+  t() %>% as.data.frame() %>% rev() %>% t() %>% as.data.frame()
+
+data_market <- read_csv("N225 Index price.csv")
+
+data_HOSE <- read_csv("weekly_stock_data_HOSE.csv")
+
+data_TSE <- read.csv("weekly_stock_data_TSE.csv", skip = 1, 
+                     stringsAsFactors=FALSE)[-2,] %>%
+                    select_if(~ !any(is.na(.)))
+colnames(data_TSE) <- paste(colnames(data_TSE), data_TSE[1, ])
+
+sector_weights <- data.frame(t(read.csv("Sector Weightings.csv", row.names = 1))) %>% 
+  mutate_all(function(x) as.numeric(sub("%", "", x))/100)
+```
+
+## DATA ANALYSIS
+
+```{r}
+df_sector <- data.frame("sector"= names(sector_weights), "weight" = colMeans(sector_weights))
+ggplot(df_sector, aes(x = "", y = weight, fill = sector)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y") +
+  theme_void() +
+  ggtitle("Average Sector Weights for N225 Index") +
+  theme(legend.position = "right") +
+  scale_fill_discrete(name = "Sector") +
+  geom_text(aes(label = percent(round(weight, 3))), 
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 2)
+
+dates <- as.Date(rownames(sector_weights), "X%m.%d.%Y")
+melted_weights <- melt(cbind(dates, sector_weights), id.vars = "dates")
+ggplot(melted_weights, aes(dates, value, color = variable)) + 
+  geom_line() + 
+  theme_bw() +
+  labs(title="Historic Sector Weightings for N225", 
+       x = "Date", y = "Weight", color = "Legend") 
+```
+
+```{r}
+clean.data1 <- function(data) {
+  log_ret <- mutate_all(data, function(x) as.numeric(as.character(x))) %>%
+              select_if(~ !any(is.na(.)))
+  log_ret <- log_ret %>% sapply(. %>% log) %>% data.frame() %>% 
+                        sapply(. %>% diff) %>% data.frame()
+  return (log_ret)
+}
+
+annual.ex  <- function(ret) { return (colMeans(ret) * (365/7)) }
+annual.sd  <- function(ret) { return (sapply(ret, sd) * sqrt(365/7)) }
+annual.cov <- function(ret) { return (cov(ret) * (365/7)) }
+
+
+
+ex_TSE_all <- annual.ex(clean.data1(data_TSE[-1, -1]))
+sd_TSE_all <- annual.sd(clean.data1(data_TSE[-1, -1]))
+
+# all stocks based off expected return, standard deviation, and Coefficient of Variation
+analysis_TSE <- cbind(ex_TSE_all, sd_TSE_all, sd_TSE_all/ex_TSE_all)
+
+household_names <- data_TSE %>% select(match(c("7203.T","6758.T", "8306.T", "7267.T","2702.T","6758.T","7974.T", "6861.T", "8035.T", "4661.T"), data_TSE[1,])) 
+dates <- as.Date(data_TSE$`Name..or.Code. RIC`, "%d/%m/%Y")
+household_stats <- melt(cbind(dates, household_names)[-1,], id.vars = "dates")
+household_stats$value <- as.numeric(household_stats$value)
+ggplot(household_stats, aes(dates, value, color = variable)) + 
+  geom_line() + 
+  labs(title="Historic Stock Prices of Household Stocks",
+       x = "Date", y = "Price (Yen)", color = "Legend") + 
+  theme_bw()
+```
+
+## QUESTION 1
+
+```{r}
+selected_TSE <- c( # classifications according to indexes.nikkei.co.jp/en/nkave/index/component?fbclid=IwAR1RK4lnNZFapJqnqSe_9hbucc2frBC6mUQDlo69BDkipcLFrzMBGiXVqNE#collapse-menu 
+  "7203.T", #Toyota Motor Corporation (Consumer Discretionary)
+  "2702.T", #McDonald.s.Holdings.Company.Japan.Ltd. (Consumer Discretionary)
+  "2802.T", #Ajinomoto.Co.Inc. (consumer discretionary)
+  "7630.T", #Ichibanya.Co.Ltd. (consumer discretionary)
+  "2897.T", #Nissin.Foods.Holdings.Co., Ltd (Consumer Staple)
+  "8316.T", #Sumitomo Mitsui Financial Group, Inc. (Financial)
+  "8306.T", #Mitsubishi UFJ Financial Group, Inc. (Financial)
+  "4519.T", #Chugai.Pharmaceutical.Co.Ltd. (HealthCare)
+  "4503.T", #Astellas Pharma Inc.  (HealthCare)
+  "4452.T", #Kao.Corp. (Industrials)
+  "4369.T", #Tri.Chemical.Laboratories.Inc. (industrials)
+  "4684.T", #Obic.Co.Ltd. (Tech)
+  "6758.T", #Sony Group Corporation (Tech)
+  "8035.T", #Tokyo Electron Limited (Tech)
+  "6861.T", #Keyence Corporation (Tech)
+  "6323.T", #Rorze Corporation (tech)
+  "6920.T", #Lasertec.Corp. (tech)
+  "9735.T", #Secom.Co.Ltd. (Tech)
+  "5401.T", #Nippon.Steel (Materials)
+  "8001.T", #ITOCHU Corporation (materials)
+  "1928.T", #Sekisui House, Ltd. (real estate)
+  "4661.T", #Oriental.Land.Co (Real Estate/Tourism)
+  "4816.T", #Toei.Animation.Co.Ltd. (Tele communications)
+  "9697.T", #Capcom.Co.Ltd. (Telecommunication)
+  "7974.T" #Nintendo.Co.Ltd. (Telecommunication)
+)
+# Manual Classification of Each Stock's Sector
+sector_components <- c(4, 1, 0, 2, 2, 2, 7, 2, 2, 3, 0)/25
+
+# Sector Weighting For Portfolio
+df_sector <- data.frame("sector"= sort(names(sector_weights)), "weight" = sector_components) %>% filter(weight > 0)
+ggplot(df_sector, aes(x = "", y = weight, fill = sector)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y") +
+  theme_void() +
+  ggtitle("Sector Weight for Chosen Portfolio") +
+  theme(legend.position = "right") +
+  scale_fill_discrete(name = "Sector") +
+  geom_text(aes(label = percent(weight)),  
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 2)
+
+# Question 1 Work
+ret_TSE <- data_TSE[-1,-1] %>% select(match(selected_TSE, data_TSE[1,]) - 1) %>% clean.data1()
+ex_TSE <- annual.ex(ret_TSE)
+sd_TSE <- annual.sd(ret_TSE)
+q01 <- list("ret" = ret_TSE, "annual stats" = t(rbind(sd_TSE, ex_TSE)))
+```
+
+Weekly Continuously Compounded Returns are given by q01\$ret
+
+Annual Expected Returns and Annual Standard Deviations are given by q01\$annual_stats.
+
+## QUESTION 2
+
+```{r}
+cov_TSE <- annual.cov(ret_TSE)
+w_15_TSE <- efficient.portfolio(ex_TSE, cov_TSE, 0.15)$weights
+q02 <- w_15_TSE
+```
+
+Weights are given by q02.
+
+## QUESTION 3
+
+```{r}
+ef_TSE <- efficient.frontier(ex_TSE, cov_TSE, nport =1000)
+
+# Efficient Frontier for 25 Asset Portfolio
+TSE_plot <- ggplot(data = data.frame(ef_TSE$sd, ef_TSE$er), 
+                   aes(ef_TSE.sd, ef_TSE.er)) + 
+  geom_point(color = 'blue')
+TSE_plot + 
+  theme_bw() +
+  xlim(0, 0.45) +
+  labs(title="Minimum Variance Frontier for Shorts Allowed Porfolio",
+        x ="Standard Deviation", y = "Expected Return")
+q03 <- TSE_plot
+```
+
+Graph is given with the code above.
+
+## QUESTION 4
+
+```{r}
+df_TSE <- data.frame(sd_TSE, ex_TSE, row.names = names(sd_TSE) %>% 
+                       sapply(function(x) substr(x, nchar(x)-6+1, nchar(x))))
+
+# Efficient Frontier for 25 Asset Stock and Each individual stock labelled
+TSE_plot + 
+  geom_point(data = df_TSE, aes(sd_TSE, ex_TSE), color='limegreen') +
+  geom_label_repel(data = df_TSE, aes(sd_TSE, ex_TSE, label = rownames(df_TSE)),
+                   max.overlaps = 30, size = 2) + 
+  labs(title="Frontier for Shorts Allowed Porfolio vs Individual Stocks", 
+       x = "Standard Deviation", y = "Expected Return") + xlim(0, 0.62) +
+  theme_bw() 
+
+# Efficient Frontier for 25 Asset Stock and Each individual stock unlabelled
+TSE_plot + 
+  geom_point(data = df_TSE, aes(sd_TSE, ex_TSE), color='limegreen') +
+  labs(title="Frontier for Shorts Allowed Porfolio vs Individual Stocks",
+       x = "Standard Deviation", y = "Expected Return") + xlim(0, 0.62) + 
+  theme_bw() 
+```
+
+None of the stocks are Mean-Variance efficient.
+
+## QUESTION 5
+
+```{r}
+w_global_TSE <-  globalMin.portfolio(ex_TSE, cov_TSE)$weights
+q05 <- w_global_TSE
+```
+
+Weights are given by q05.
+
+## QUESTION 6
+
+```{r}
+equal_weighted_portfolio <- getPortfolio(ex_TSE, cov_TSE, rep(1/25, 25))
+
+
+TSE_plot + geom_point(data = data.frame(equal_weighted_portfolio$sd, equal_weighted_portfolio$er), aes(equal_weighted_portfolio.sd, equal_weighted_portfolio.er), color = 'orange') +
+  labs(title="Frontier for Shorts Allowed Porfolio vs
+       an Equally Weighted Portfolio",
+       x = "Standard Deviation", y = "Expected Return") + xlim(0, 0.8) +
+  theme_bw()
+
+```
+
+In the graph we can clearly see that the equally weighted portfolio, represented by the orange dot, is within the minimum variance frontier.
+
+## QUESTION 7
+
+```{r}
+#analysis of Vietnamese Stocks to pick suitable stocks
+ex_HOSE_all <- annual.ex(data_HOSE[,-1])
+sd_HOSE_all <- annual.sd(data_HOSE[,-1])
+
+#create data so the statistics can be sorted
+analysis_HOSE <- cbind(ex_HOSE_all, sd_HOSE_all, sd_HOSE_all/ex_HOSE_all) %>% na.omit()
+
+selected_HOSE <- c(
+  "VNM", #VinaMilk
+  "CTG", #VietNam Commerical Bank
+  "NSC", # National Seed Co
+  "PAC", #Dry Cell and Storage Battery Co
+  "HDG" #Ha DO Group.
+)
+
+company_names <- data_HOSE[,-1] %>% 
+  select_if(~ !any(is.na(.))) %>%
+  colnames() %>% 
+  substr(., 1, 3)
+
+
+```
+
+\-**VinaMilk** is a leading dairy company in Vietnam. It has potential for growth in the emerging market of dairy products. Furthermore, it will hopefully increase the diversification by having a company in consumer staple sector as the original portfolio had little assets belonging to Consumer Staples.
+
+\-**Viet Nam Joint Stock Commercial Bank** Positioned in the growing Vietnamese financial sector. Major bank in Vietnam with a diverse range of financial services. It has extremely good long-term financial health, with D/E ratio of 23.35% compared to an industry average of 102.66% in and their other ratios are about industry standard as well (Investing.com).
+
+\-**National Seed Co** is engaged in the production and distribution of seeds for farming. Since none of the chosen stocks included any assets in agriculture, National Seed Co was included as it is a leader in agricultural investments and products in Vietnam.
+
+\-**Dry Cell and Storage Battery Co** is involved with the production of dry cells and batteries. As Vietnam\'s economy and it begin relying on IT solutions and technology, Dry Cell and Storage Battery Co will be positioned in the Vietnamese market to meet that demand.
+
+\-**Ha Do Group Co** is a real estate development and construction in Vietnam. It is positioned to target the Vietnam\'s growing real estate market. Furthermore, it has one of the stocks with lower risks in Vietnamese stocks.
+
+## QUESTION 8
+
+```{r}
+ret_HOSE <- data_HOSE[,-1] %>% 
+  mutate_all(function(x) as.numeric(as.character(x)) *
+               VND_to_JPY_Exchange_rate$'Adj Close'[-1]) %>%
+  select_if(~ !any(is.na(.))) %>% 
+  clean.data1() %>%
+  select(match(selected_HOSE, company_names))
+colnames(ret_HOSE) <- substr(colnames(ret_HOSE), 1, 3)
+
+ex_HOSE <- annual.ex(ret_HOSE)
+sd_HOSE <- annual.sd(ret_HOSE)
+q08 <- list("returns" = ret_HOSE, "annual stats" = t(rbind(sd_HOSE, ex_HOSE)))
+```
+
+## QUESTION 9
+
+```{r}
+ret_stocks <- cbind(ret_TSE, ret_HOSE)
+ex_stocks <- annual.ex(ret_stocks)
+cov_stocks <- annual.cov(ret_stocks)
+
+portfolio.risk <- function(w, covar) {
+  return ((t(w) %*% covar %*% w) ^ (1/2))
+}
+
+w_15_stocks <- efficient.portfolio(ex_stocks, cov_stocks, 0.15)$weights
+risk_difference <- portfolio.risk(w_15_TSE, cov_TSE) - portfolio.risk(w_15_stocks, cov_stocks)
+q09 <- list("weights" = w_15_stocks, "risk diff" = risk_difference)
+```
+
+Compared to a portfolio only consisting of TSE stocks, 3.05% risk was eliminated in the TSE and HOSE stocks, which can be attributed to the diversification of the portfolio with the addition of new assets.
+
+## QUESTION 10
+
+```{r}
+ef_stocks <- efficient.frontier(ex_stocks, cov_stocks, nport = 1000)
+
+ggplot(data = data.frame(ef_TSE$sd, ef_TSE$er), aes(ef_TSE.sd, ef_TSE.er, color = "25 Asset Portfolio")) + 
+  geom_point() + 
+  geom_point(data = data.frame(ef_stocks$sd, ef_stocks$er), 
+             aes(ef_stocks.sd, ef_stocks.er, color = "30 Asset Portfolio")) + 
+  labs(title="Efficient Frontier for 25 Asset vs 30 Asset Portfolio", 
+       x = "Standard Deviation", 
+       y = "Expected Return", 
+       color = "Legend") + 
+  xlim(0, 0.45) +  
+  scale_color_manual(values = c("25 Asset Portfolio" = "blue", 
+                                "30 Asset Portfolio" = "red")) +
+  theme_bw() 
+```
+
+The addition of 5 HOSE assets to the 25 TSE stocks has shifted the entire efficient frontier left which indicates a decrease in standard deviation for the same expected return. This agrees with intuition, where the addition of Vietnamese Stocks has increased the diversification of our portfolio, which has decreased the unsystematic risk.
+
+## QUESTION 11
+
+```{r}
+limit.stock <- function(total_er, limit_miu_er, ret, restricted_stocks) {
+  amat <- cbind(annual.ex(ret), rep(1, ncol(ret)), -1 * restricted_stocks)
+  qp <- solve.QP(Dmat = 2 * annual.cov(ret), 
+                 dvec = matrix(rep(0, ncol(ret))),
+                 Amat = amat,
+                 bvec = c(total_er, 1, -1 * limit_miu_er),
+                 meq = 2)
+  return (qp$solution)
+}
+w_15_stocks_HOSE.06 <- limit.stock(0.15, 0.06, ret_stocks, c(rep(0, 25), rep(1, 5)))
+q11 <- w_15_stocks_HOSE.06
+```
+
+## QUESTION 12
+
+```{r}
+
+tech_companies <- c(
+  "4684.T", #Obic.Co.Ltd. (Tech)
+  "6758.T", #Sony Group Corporation (Tech)
+  "8035.T", #Tokyo Electron Limited (Tech)
+  "6861.T", #Keyence Corporation (Tech)
+  "6323.T", #Rorze Corporation (tech)
+  "6920.T", #Lasertec.Corp. (tech)
+  "9735.T" #Secom.Co.Ltd. (Tech)
+)
+constraint_indices <- match(tech_companies, sapply(names(ex_TSE), function(x) substr(x, nchar(x)-6+1, nchar(x))))
+constraint_tech <- ifelse(seq(1, 25) %in% constraint_indices, 1, 0)
+w_15_TSE_tech.10 <- limit.stock(0.15, 0.1, ret_TSE, constraint_tech)
+
+q12 <- w_15_TSE_tech.10
+```
+
+## QUESTION 13
+
+```{r}
+mius <- seq(0, 1.5, 0.01)
+sd_TSE_tech.10 <- c()
+for (miu in mius) {
+  w_ef <- limit.stock(miu, 0.1, ret_TSE, constraint_tech)
+  sd_TSE_tech.10 <- c(sd_TSE_tech.10, portfolio.risk(w_ef, cov_TSE))
+}
+
+
+
+TSE_plot + 
+  geom_point(data = data.frame(ef_TSE$sd, ef_TSE$er), 
+                      aes(ef_TSE.sd, ef_TSE.er), color = 'red') +
+  labs(title="Efficient Frontier for Portfolio with 10% limit on Tech",
+       x = "Standard Deviation",
+       y = "Expected Return") + 
+  xlim(0, 0.45) +
+  theme_bw()
+# Note that the two graphs are overlapped
+```
+
+The Unrestricted Efficient Frontier vs the Tech Restricted Efficient Frontier completely overlap, suggesting little to no effect on risk by restricting the tech amount. This can be attributed to the diversification of the stock, making that even with a sectorial restriction, the same efficient portfolio can be achieved.
+
+## QUESTION 14
+
+```{r}
+w_15_TSE_no.short <- efficient.portfolio(ex_TSE, cov_TSE, 0.15, FALSE)$weights
+q14 <- cbind(w_15_TSE, w_15_TSE_no.short)
+colnames(q14) <- c("short","no_short")
+print(q14)
+
+
+```
+
+As expected, by restricting it such that no weights are allowed. Any weights that were originally negative are now zero. That's logical considering that we only shorted them to begin with because we didn't expect them to increase in value. To offset that, some stocks increase and some stocks decrease. This can be attributed to investing more in stocks with lower variance, as well as the fact that with no negative weights, our threshold for total positive weights has been decreased.
+
+## QUESTION 15
+
+```{r}
+w_global_TSE_no.short <-  globalMin.portfolio(ex_TSE, cov_TSE, short = FALSE)$weights
+q15 <- t(rbind(w_global_TSE, w_global_TSE_no.short))
+print(q15)
+```
+
+Similar to the previous question, we see the exact same thing occur where all negative weights are now 0, and the stocks readjust themselves. It's interesting to note that the stocks that were originally decreasing are the same and so are the increasing ones. This indicates that the stocks being increased produce a higher mean relative to the cost of their risk.
+
+## QUESTION 16
+
+```{r}
+ef_TSE_no_short <- efficient.frontier(ex_TSE, cov_TSE, nport = 1000, short = FALSE)
+
+
+ggplot(data = data.frame(ef_TSE$sd, ef_TSE$er), 
+       aes(ef_TSE.sd, ef_TSE.er, color = "25 Asset Shorts Allowed")) + 
+  geom_point() + 
+  geom_point(data = data.frame(ef_TSE_no_short$sd, ef_TSE_no_short$er), 
+       aes(ef_TSE_no_short.sd, ef_TSE_no_short.er, color = "25 Asset No Shorts")) +
+  labs(title="Efficient Frontier for TSE portfolio with Short Restrictions", 
+       x = "Standard Deviation", 
+       y = "Expected Return",
+       color = "Legend") + 
+  xlim(0, 0.8) + 
+  scale_color_manual(values = c("25 Asset Shorts Allowed" = "red", 
+                                "25 Asset No Shorts" = "blue")) +
+  theme_bw() 
+```
+
+The least increase in portfolio risk is at the global minimum variance portfolio, and the greatest increase in risk occurs at the highest expected return.
+
+## QUESTION 17
+
+```{r}
+ret_JGB <- data_JGB %>%
+  mutate_all(function(x) as.numeric(sub("%", "", x))) %>%
+  mutate(JGB = log(1+Open/(100*365/7)), .keep = "none")
+ex_JGB <- annual.ex(ret_JGB)
+sd_JGB <- annual.sd(ret_JGB)
+q17 <- list("returns" = ret_JGB, "annual stats" = cbind(sd_JGB, ex_JGB))
+print("")
+print(q17$`annual stats`)
+
+```
+
+The expected return of the risk-free asset is 0.13% and the standard deviation is 0.01176%.
+
+## QUESTION 18
+
+```{r}
+ret_combined <- cbind(ret_TSE, ret_JGB)
+ex_combined <- annual.ex(ret_combined)
+cov_combined <- annual.cov(ret_combined)
+ef_combined <- efficient.frontier(ex_combined, cov_combined, nport = 3000, short = FALSE)
+
+
+qplot(ef_combined$sd, ef_combined$er) + 
+  geom_point(color = 'blue') + 
+  labs(title="Efficient Frontier for TSE portfolio with 3 Month Govnerment Bonds",
+       x = "Standard Deviation", 
+       y = "Expected Return") + 
+  theme_bw() 
+```
+
+## QUESTION 19
+
+```{r}
+w_15_combined <- efficient.portfolio(ex_combined, cov_combined, 0.15, FALSE)$weights
+q19 <- list("weights" = t(rbind(c(w_15_TSE_no.short, 0), w_15_combined)), 
+            "risk" = t(rbind(portfolio.risk(w_15_TSE_no.short, cov_TSE), 
+                             portfolio.risk(w_15_combined, cov_combined))))
+print(q19)
+```
+
+The compositions of the two portfolios are very similar. The portfolio with the introduction of a risk free asset, have the weights most originally present signifcantly decreased, and a large proportion of weights put into the risk-free asset. Obviously, this would decrease the variance. We see this reflected in the risk, going from 14.1% to 11.2% with the introduction of the risk-free asset.
+
+## QUESTION 20
+
+```{r}
+w_global_combined <- globalMin.portfolio(ex_combined, cov_combined, shorts = FALSE)$weights
+q20 <- list("weights" = t(rbind(c(w_global_TSE_no.short, 0), w_global_combined)),
+            "risk" = t(rbind(portfolio.risk(w_global_TSE_no.short, cov_TSE), 
+                             portfolio.risk(w_global_combined, cov_combined))))
+print(q20)
+```
+
+It is unsurprising that the unrestricted MVP on the right has almost 0 weights for everything except the risk free asset. As the risk-free asset would indeed produce the lowest variance. Similarly, the restricted weights on the left have utilised the most of the riskfree asset as they can according to the restriction. If we examine the risks as well. It is unsurprising that the unrestricted MVP has risk close to 0 while the restricted MVP has risk at 13.8%.
+
+## QUESTION 21
+
+```{r}
+limit.equity <- function(target_er, ret) {
+  amat <- cbind(annual.ex(ret),
+                rep(1, ncol(ret)),
+                c(rep(1, ncol(ret) - 1), 0),
+                diag(ncol(ret)))
+  b <- c(target_er, 1, 0.95, rep(0, ncol(ret)))
+  qp <- solve.QP(Dmat = 2 * annual.cov(ret), 
+                 dvec = matrix(rep(0, ncol(ret))),
+                 Amat = amat,
+                 bvec = b,
+                 meq = 2)
+  return (round(qp$solution, 6))
+}
+
+mius <- seq(ex_JGB, 0.4, 0.001)
+mean_everything_.95 <- c()
+sd_everything_.95 <- c()
+
+ret_everything <- cbind(ret_TSE, ret_HOSE, ret_JGB)
+ex_everything <- annual.ex(ret_everything)
+cov_everything <- annual.cov(ret_everything)
+for (miu in mius) {
+  w_ef <- limit.equity(miu, ret_everything)
+  sd_everything_.95 <- c(sd_everything_.95, portfolio.risk(w_ef, cov_everything))
+}
+
+ef_everything_no.short <- efficient.frontier(ex_everything, cov_everything, short = FALSE)
+
+ggplot(data.frame(ef_everything_no.short$sd, ef_everything_no.short$er), 
+       aes(ef_everything_no.short.sd, ef_everything_no.short.er, color = 'Unrestricted')) + 
+  geom_line(linewidth = 2) + 
+  geom_point(data = data.frame(sd_everything_.95, mius), aes(sd_everything_.95, mius, color = '95% Equity')) +
+  labs(title="EF for Portfolio with TSE, HOSE, and 3 Month Government Bond",
+       x = "Standard Deviation", 
+       y = "Expected Return",
+       color = 'Legend') + 
+  scale_color_manual(values = c("95% Equity" = "red", 
+                                "Unrestricted" = "blue")) +
+  theme_bw() 
+```
+
+## QUESTION 22
+
+```{r}
+w_everything <- efficient.portfolio(ex_everything, cov_everything, 0.15, FALSE)$weights
+w_everything.95 <- limit.equity(0.15, ret_everything)
+
+names(w_everything.95) <- names(w_everything)
+
+comparison_weights <- t(rbind(w_everything, w_everything.95))
+colnames(comparison_weights) <- c("Unrestricted", "95% Equity Restriction")
+rownames(comparison_weights) <- sapply(rownames(comparison_weights), function(x) substr(x, nchar(x)-6+1, nchar(x)))
+comparison_weights <- melt(comparison_weights)
+colnames(comparison_weights) <- c("Asset", "Portfolio", "Weight")
+
+ggplot(comparison_weights, aes(Asset, Weight, fill = Portfolio)) + 
+  geom_bar(stat="identity", position = 'dodge') + 
+  labs(title = "Weights for No Shorts Allowed 30 Asset Portfolio with Target Return of 15%") +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+q22 <- cbind(w_everything, w_everything.95)
+```
+
+When comparing the weights for these portfolios with a target expected return of 15%, all the weights of stocks used in the unrestricted portfolio increase which is unsurprising. However, one of the Vietnamese stocks that had a weighting of 0, now has the most weight in the restricted portfolio. The asset has one of lower risks and higher returns of all the stocks, so it is likely that this asset has the highest mean to risk efficiency, allowing the portfolio to reach the 15% target return threshold.
+
+## QUESTION 23
+
+```{r}
+# calculated manually and with inbuilt function
+ret_market <- clean.data1(data_market[-331,-1])$Adj.Close
+ex_market <- mean(ret_market) * 365/7
+
+beta1 <- cov(ret_TSE, ret_market) / (var(ret_market))
+#vs
+beta2 <- CAPM.beta(
+  xts(ret_TSE, order.by = as.Date(data_HOSE$...1)[-1]),
+  xts(ret_market, order.by = as.Date(data_HOSE$...1)[-1]),
+)
+
+q23 <- beta1
+```
+
+## QUESTION 24
+
+```{r}
+sysRisk1 <- beta1^2 * var(ret_market) * 365/7
+#vs
+sysRisk2 <- 
+  SystematicRisk(
+    xts(ret_TSE, order.by = as.Date(data_HOSE$...1)[-1]),
+    xts(ret_market, order.by = as.Date(data_HOSE$...1)[-1]),
+    scale = 365/7
+)
+rownames(sysRisk2) <- colnames(sysRisk1)
+#print((cbind(sysRisk1, t(sysRisk2)^2)))
+
+UnsysRisk <- sd_TSE ^ 2 - sysRisk1
+q24 <- cbind(sysRisk1, UnsysRisk)
+print(q24)
+```
+
+## QUESTION 25
+
+```{r}
+sml <- lm(ex_TSE ~ beta1)
+rf_rate <- sml$coefficients[1]
+df_beta <- data.frame(beta1, ex_TSE, row.names = rownames(df_TSE))
+colnames(df_beta) <- c("Beta", "Return")
+
+ggplot(df_beta, aes(Beta, Return)) + geom_point(color = "limegreen") +
+  geom_abline(intercept = sml$coefficients[1], 
+              slope =sml$coefficients[2], color = 'red') + 
+  labs(title="Security Market Line", x = "Beta", y = "Expected Return") +
+  theme_bw() + 
+  xlim(0, 0.8) + 
+  ylim(0, 0.5)
+
+ggplot() + 
+  geom_abline(intercept = sml$coefficients[1], 
+              slope =sml$coefficients[2], 
+              color = 'red') +
+  geom_point(data = df_beta, aes(Beta, Return), color = "limegreen") +
+  geom_label_repel(data = df_beta, 
+                   aes(Beta, Return, label = rownames(df_beta)), 
+                   max.overlaps = 30, size = 2) +
+  labs(title="Security Market Line", x = "Beta", y = "Expected Return") +
+  theme_bw() + 
+  xlim(0, 0.8) + 
+  ylim(0, 0.5)
+```
+
+The implied Risk free rate is 4.50%. The stocks above the line are under priced whereas the stocks below the line are overpriced as anything below the line has a lower return compared to the market for that same beta value.
+
+## Additional Graphs
+
+```{r}
+###3-7 together
+ggplot(data = data.frame(ef_TSE$sd, ef_TSE$er), 
+       aes(ef_TSE.sd, ef_TSE.er, color = "25 Asset Shorts Allowed")) + 
+  geom_point() +
+  geom_point(data = data.frame(ef_TSE_no_short$sd, ef_TSE_no_short$er), 
+       aes(ef_TSE_no_short.sd, ef_TSE_no_short.er, color = "25 Asset No Shorts Allowed")) +
+  geom_point(data = data.frame(ef_stocks$sd, ef_stocks$er), 
+             aes(ef_stocks.sd, ef_stocks.er, color = "30 Asset Shorts Allowed")) +
+  geom_point(data = data.frame(equal_weighted_portfolio$sd,
+                               equal_weighted_portfolio$er), 
+             aes(equal_weighted_portfolio.sd, equal_weighted_portfolio.er, 
+             color = "Equally Weighted Portfolio")) +
+  geom_point(data = df_TSE, aes(sd_TSE, ex_TSE, color='TSE Stocks')) + 
+  geom_point(data = data.frame(sd_HOSE, ex_HOSE), aes(sd_HOSE, ex_HOSE, color="HOSE Stocks")) +
+  labs(title="Efficiency Frontier for Portfolios with Shorts Allowed", 
+       x = "Standard Deviation", 
+       y = "Expected Return",
+       color = "Legend") + 
+  xlim(0, 0.7) +
+  scale_color_manual(values = c("25 Asset Shorts Allowed" = "blue",
+                                "25 Asset No Shorts Allowed" = "purple",
+                                "30 Asset Shorts Allowed" = 'red',
+                                "Equally Weighted Portfolio" = "orange",
+                                "TSE Stocks" = "limegreen",
+                                "HOSE Stocks" = "cyan")) +
+  theme_bw()
+```
+
+```{r}
+TSE_plot + 
+  geom_point(data = data.frame(ef_TSE_no_short$sd, ef_TSE_no_short$er), 
+       aes(ef_TSE_no_short.sd, ef_TSE_no_short.er), color = "purple") +
+  geom_point(data = df_TSE, aes(sd_TSE, ex_TSE), 
+             color=ifelse(round(q14[,1] - abs(q14[,2]), 2) < 0, 'firebrick2',
+                   ifelse(round(q14[,1] - abs(q14[,2]), 2) > 0,'limegreen', 'gold1'))) +
+  labs(title="Weight change when short sell constraints are added",
+       x = "Standard Deviation", y = "Expected Return") + xlim(0, 0.62) + 
+  theme_bw() 
+```
+
+```{r}
+ggplot(data.frame(ef_everything_no.short$sd, ef_everything_no.short$er), 
+       aes(ef_everything_no.short.sd, ef_everything_no.short.er, color = 'Unrestricted 30 Asset and Government Bond')) + 
+  geom_line(linewidth = 2) + 
+  geom_point(data = data.frame(sd_everything_.95, mius), aes(sd_everything_.95, mius, color = '95% Equity 30 Asset and Government Bond')) +
+  geom_point(data = df_TSE, aes(sd_TSE, ex_TSE, color='TSE Stocks')) + 
+  geom_point(data = data.frame(sd_HOSE, ex_HOSE), aes(sd_HOSE, ex_HOSE, color="HOSE Stocks")) +
+  labs(title="Efficient Frontier for Portfolios with No Shorts Allowed", 
+       x = "Standard Deviation", 
+       y = "Expected Return",
+       color = "Legend") + 
+  xlim(0, 0.7) +
+  scale_color_manual(values = c("Unrestricted 30 Asset and Government Bond" = "blue",
+                                "95% Equity 30 Asset and Government Bond" = 'red',
+                                "Equally Weighted Portfolio" = "orange",
+                                "TSE Stocks" = "limegreen",
+                                "HOSE Stocks" = "cyan")) +
+  theme_bw()
+```
